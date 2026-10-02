@@ -1,95 +1,110 @@
 package com.shashi.rca.service;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.ai.document.Document;
-import org.springframework.ai.vectorstore.VectorStore;
-import org.springframework.kafka.annotation.KafkaListener;
-import org.springframework.stereotype.Service;
-import com.shashi.rca.dto.RcaReport;
+import com.shashi.rca.config.KafkaConfig;
 import com.shashi.rca.dto.TelemetryMessage;
 import com.shashi.rca.model.Incident;
 import com.shashi.rca.model.IncidentStatus;
-import com.shashi.rca.model.RcaReportEntity;
 import com.shashi.rca.repository.IncidentRepository;
-import com.shashi.rca.repository.RcaReportRepository;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Service;
+import tools.jackson.databind.json.JsonMapper;
 
+import java.time.Duration;
+import java.time.LocalDateTime;
 import java.util.List;
-import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
+/**
+ * Fast path: parse, de-duplicate, group and store. The slow LLM work happens in {@link IncidentAnalysisService}.
+ */
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class TelemetryIngestionService {
 
+    private static final List<IncidentStatus> REUSABLE = List.of(
+            IncidentStatus.OPEN, IncidentStatus.ANALYZING, IncidentStatus.DONE);
+
     private final IncidentRepository incidentRepository;
-    private final RcaReportRepository rcaReportRepository;
-    private final RcaOrchestratorService rcaOrchestratorService;
-    private final VectorStore vectorStore;
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final KafkaTemplate<String, String> kafkaTemplate;
+    private final JsonMapper jsonMapper;
+    private final Duration groupingWindow;
+    private final Counter incidentsReceived;
 
-    @KafkaListener(topics = "app.telemetry.raw")
-    public void processIncomingTelemetry(String rawJsonPayload) {
-        TelemetryMessage telemetry;
-        try {
-            telemetry = objectMapper.readValue(rawJsonPayload, TelemetryMessage.class);
-        } catch (JsonProcessingException e) {
-            log.error("Skipping message that is not valid telemetry JSON: {}", rawJsonPayload, e);
-            return;
-        }
+    public TelemetryIngestionService(IncidentRepository incidentRepository,
+                                     KafkaTemplate<String, String> kafkaTemplate,
+                                     JsonMapper jsonMapper,
+                                     MeterRegistry meterRegistry,
+                                     @Value("${rca.grouping.window:30m}") Duration groupingWindow) {
+        this.incidentRepository = incidentRepository;
+        this.kafkaTemplate = kafkaTemplate;
+        this.jsonMapper = jsonMapper;
+        this.groupingWindow = groupingWindow;
+        this.incidentsReceived = meterRegistry.counter("rca.incidents.received");
+    }
 
-        log.info("Received telemetry packet from service [{}] with trace [{}]", telemetry.service(), telemetry.traceId());
+    @KafkaListener(topics = KafkaConfig.RAW_TOPIC, groupId = "rca-ingest")
+    public void onTelemetry(String rawJson) {
+        TelemetryMessage telemetry = jsonMapper.readValue(rawJson, TelemetryMessage.class);
 
         if (telemetry.exception() == null || telemetry.exception().isBlank()) {
+            return; // not an error, nothing to analyse
+        }
+        if (isBlank(telemetry.traceId()) || isBlank(telemetry.service())) {
+            throw new IllegalArgumentException("Telemetry is missing traceId or service: " + rawJson);
+        }
+        incidentsReceived.increment();
+
+        String signature = ErrorSignature.of(telemetry.service(), telemetry.exception(), telemetry.message());
+        LocalDateTime now = LocalDateTime.now();
+        Optional<Incident> original = incidentRepository.findRecentOriginal(
+                signature, REUSABLE, now.minus(groupingWindow));
+
+        String incidentId = UUID.randomUUID().toString();
+        int inserted = incidentRepository.insertIfAbsent(
+                incidentId, telemetry.traceId(), telemetry.service(), telemetry.exception(), telemetry.message(),
+                signature, original.map(Incident::getId).orElse(null),
+                (original.isPresent() ? IncidentStatus.DONE : IncidentStatus.OPEN).name(), now);
+
+        if (inserted == 0) {
+            handleDuplicateTrace(telemetry.traceId());
+            return;
+        }
+        if (original.isPresent()) {
+            log.info("Incident {} grouped with {} (same error signature), no LLM call.", incidentId, original.get().getId());
             return;
         }
 
-        Incident incident = incidentRepository.findByTraceId(telemetry.traceId()).orElse(null);
-        if (incident != null && incident.getStatus() != IncidentStatus.FAILED) {
-            log.info("Trace [{}] already has incident {} ({}), skipping.", telemetry.traceId(), incident.getId(), incident.getStatus());
-            return;
-        }
+        log.warn("[RCA step 0/4] New incident {} for trace {} on [{}] — queued for analysis.",
+                incidentId, telemetry.traceId(), telemetry.service());
+        requestAnalysis(incidentId);
+    }
 
-        if (incident == null) {
-            incident = incidentRepository.save(Incident.builder()
-                    .id(UUID.randomUUID().toString())
-                    .traceId(telemetry.traceId())
-                    .rootService(telemetry.service())
-                    .triggerException(telemetry.exception())
-                    .status(IncidentStatus.OPEN)
-                    .build());
-            log.warn("🚨 New Incident {} created for trace {}.", incident.getId(), telemetry.traceId());
+    /**
+     * Kafka delivers at least once, so the same trace can arrive again. If the first attempt crashed after
+     * saving but before publishing, the incident is still OPEN and is re-published; the analysis worker's
+     * status check makes a second request harmless.
+     */
+    private void handleDuplicateTrace(String traceId) {
+        Incident existing = incidentRepository.findByTraceId(traceId).orElseThrow();
+        if (existing.getStatus() == IncidentStatus.OPEN && existing.getDuplicateOf() == null) {
+            log.info("Trace {} seen again while still OPEN, re-publishing analysis request.", traceId);
+            requestAnalysis(existing.getId());
         } else {
-            log.warn("🔁 Retrying analysis for previously FAILED incident {}.", incident.getId());
+            log.info("Duplicate trace {} ignored (incident {} is {}).", traceId, existing.getId(), existing.getStatus());
         }
+    }
 
-        try {
-            RcaReport report = rcaOrchestratorService.runAnalysis(telemetry.exception(), telemetry.message(), telemetry.service());
+    private void requestAnalysis(String incidentId) {
+        kafkaTemplate.send(KafkaConfig.ANALYSIS_TOPIC, incidentId, incidentId).join();
+    }
 
-            rcaReportRepository.save(RcaReportEntity.builder()
-                    .id(UUID.randomUUID().toString())
-                    .incident(incident)
-                    .rootCause(report.rootCause())
-                    .confidenceScore(report.confidence())
-                    .impactedServices(String.join(",", report.affectedServices()))
-                    .remediations(String.join(";", report.recommendation()))
-                    .build());
-            log.info("✅ Structured RCA Report successfully generated for incident: {}", incident.getId());
-
-            // FEEDBACK LOOP: seed the vector store so the system learns from this incident
-            String vectorSummary = String.format("Log: %s | Cause: %s | Fix: %s",
-                    telemetry.message(), report.rootCause(), String.join("; ", report.recommendation()));
-            vectorStore.add(List.of(new Document(vectorSummary, Map.of("service", telemetry.service()))));
-            log.info("🧠 Fed incident pattern back into pgvector knowledge base.");
-
-            incident.setStatus(IncidentStatus.ANALYZED);
-        } catch (Exception e) {
-            log.error("❌ RCA analysis failed for incident {}. Marked FAILED so it can be retried.", incident.getId(), e);
-            incident.setStatus(IncidentStatus.FAILED);
-        }
-        incidentRepository.save(incident);
+    private static boolean isBlank(String s) {
+        return s == null || s.isBlank();
     }
 }

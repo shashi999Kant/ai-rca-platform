@@ -3,47 +3,97 @@ spring:
     name: ai-rca-platform
 
   # 1. Database Connections
+
   datasource:
-    url: jdbc:postgresql://localhost:5432/rca_db
+    url: jdbc:postgresql://localhost:5433/rca_db
+
     username: rca_user
+
     password: rca_password
+
     driver-class-name: org.postgresql.Driver
+
   sql:
     init:
-      mode: always # Forces execution of your schema.sql layout
+      mode: always # schema.sql owns the tables
+
   jpa:
     hibernate:
-      ddl-auto: update
+      ddl-auto: validate
+
     show-sql: false
+
   neo4j:
     uri: bolt://localhost:7687
+
     authentication:
       username: neo4j
+
       password: rca_password
 
-  # 2. Automated Vector Store Provisioning
+  # 2. Google Gemini for chat and embeddings (API key from environment)
+
   ai:
+    google:
+      genai:
+        api-key: <>
+
+        chat:
+          # Same family as REST model gemini-flash-latest (often less "high demand" than 2.5-flash)
+
+          model: gemini-flash-latest
+
+        embedding:
+          api-key: <>
+
+          text:
+            model: gemini-embedding-001
+
+            dimensions: 1536
+
     vectorstore:
       pgvector:
         table-name: vector_store_records
-        initialize-schema: true # Tells Spring AI to auto-generate this table
-        dimensions: 1536        # Standard dimension size for Gemini embeddings
 
-    # 3. Google GenAI Gateway Options
-    google:
-      genai:
-        api-key: ${SPRING_AI_GOOGLE_GENAI_API_KEY}
-        chat:
-          model: gemini-2.5-flash
-        embedding:
-          text:
-            model: gemini-embedding-001
-            dimensions: 1536
-          api-key: ${SPRING_AI_GOOGLE_GENAI_API_KEY}
+        initialize-schema: true
 
-  # 4. Local Kafka Broker Boundaries
+        dimensions: 1536
+
+  # 3. Local Kafka Broker
+
   kafka:
     bootstrap-servers: localhost:9092
+
     consumer:
       group-id: rca-core-consumers
+
       auto-offset-reset: earliest
+
+# 4. Metrics: only health and Prometheus are exposed
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+
+# 5. RCA engine settings
+
+rca:
+  kafka:
+    retry:
+      max-retries: 3 # attempts after the first failure: 2s, 4s, 8s
+
+      initial-interval: 2s
+
+  rag:
+    similarity-threshold: 0.75
+
+    top-k: 3
+
+  grouping:
+    window: 30m # reuse a report for the same error signature within this window
+
+  llm:
+    timeout: 60s # structured RCA needs more time than a one-line REST test
+

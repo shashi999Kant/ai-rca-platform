@@ -18,17 +18,21 @@ public class GraphDataInitializer implements CommandLineRunner {
     public void run(String... args) {
         log.info("Seeding Neo4j Microservice Topology Map via Native Cypher...");
 
-        // MERGE only creates a node/relationship if it does not exist yet, so this is safe to run on every startup
+        // The demo graph is rebuilt on every startup so it always matches this code
+        String resetQuery = "MATCH (s:Service) DETACH DELETE s";
         String seedQuery = """
-                MERGE (cust:Service {name: 'customer-service'})
-                MERGE (acct:Service {name: 'account-service'})
-                MERGE (notif:Service {name: 'notification-service'})
+                CREATE (gateway:Service {name: 'api-gateway'})
+                CREATE (signup:Service {name: 'signup-service'})
+                CREATE (kyc:Service {name: 'kyc-service'})
+                CREATE (acct:Service {name: 'account-service'})
 
-                MERGE (cust)-[:CALLS]->(acct)
-                MERGE (acct)-[:CALLS]->(notif)
+                CREATE (gateway)-[:CALLS]->(signup)
+                CREATE (signup)-[:CALLS]->(acct)
+                CREATE (kyc)-[:CALLS]->(acct)
                 """;
 
         try (Session session = neo4jDriver.session()) {
+            session.run(resetQuery);
             session.run(seedQuery);
             log.info("✅ Neo4j Topology Mesh Seeded Successfully using Native Session Mapping.");
         } catch (Exception e) {

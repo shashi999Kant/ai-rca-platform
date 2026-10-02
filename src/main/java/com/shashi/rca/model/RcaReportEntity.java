@@ -2,6 +2,7 @@ package com.shashi.rca.model;
 
 import jakarta.persistence.*;
 import lombok.*;
+
 import java.time.LocalDateTime;
 
 @Entity
@@ -16,8 +17,8 @@ public class RcaReportEntity {
     @Id
     private String id;
 
-    @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "incident_id")
+    @OneToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "incident_id", nullable = false)
     private Incident incident;
 
     @Column(name = "root_cause", nullable = false, columnDefinition = "TEXT")
@@ -32,7 +33,13 @@ public class RcaReportEntity {
     @Column(columnDefinition = "TEXT")
     private String remediations;
 
-    @Column(name = "generated_at")
+    @Column(nullable = false)
+    private boolean verified;
+
+    @Column(name = "verified_at")
+    private LocalDateTime verifiedAt;
+
+    @Column(name = "generated_at", nullable = false)
     private LocalDateTime generatedAt;
 
     @PrePersist
