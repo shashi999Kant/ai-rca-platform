@@ -138,5 +138,3 @@ Service: account-service
 ## 📊 Project Goal
 
 This project demonstrates how **event-driven architecture, RAG, vector search, knowledge graphs, and LLMs** can be combined to assist engineers in investigating application incidents.
-
-> This is a learning/portfolio project using synthetic incident data and is not intended for production use as-is.
